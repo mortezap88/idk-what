@@ -1,0 +1,6 @@
+{
+  "name": "FlashRecall",
+  "description": "Smart flashcard and audio-assisted learning app with AI tutoring, spaced repetition, and pause-aware voice note transcription.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

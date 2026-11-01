@@ -1,0 +1,34 @@
+<resources>
+    <string name="app_name">FlashRecall</string>
+    <string name="settings_backup_title">Data &amp; Memory (.flashdata)</string>
+    <string name="settings_backup_subtitle">Export or restore your API keys, review items, subjects, chat history, media, and notes.</string>
+    <string name="settings_backup_export_button">Export .flashdata</string>
+    <string name="settings_backup_import_button">Import .flashdata</string>
+    <string name="settings_backup_encryption_note">Exported .flashdata files include your saved API keys and full app memory so you can restore them anytime. Keep backup files private.</string>
+    <string name="settings_backup_confirm_title">Restore .flashdata backup?</string>
+    <string name="settings_backup_confirm_body">Importing %1$s will replace your current API keys, review items, subjects, and notes with the backup contents.</string>
+    <string name="settings_backup_confirm_action">Import &amp; Replace</string>
+    <string name="settings_backup_cancel_action">Cancel</string>
+    <string name="subject_generate_the_question_button">Generate the question</string>
+    <string name="subject_generating_single_question_title">Generating the question…</string>
+    <string name="subject_generating_single_question_subtitle">Thinking through your conversation and Textbook to craft the question and answer…</string>
+    <string name="subject_preview_question_header">Generated question</string>
+    <string name="subject_preview_question_label">Question</string>
+    <string name="subject_preview_answer_label">Answer</string>
+    <string name="subject_preview_back_to_chat">Back to chat</string>
+    <string name="subject_preview_regenerate">Regenerate</string>
+    <string name="subject_preview_save">Save</string>
+    <string name="review_extract_question_button">Extract Question</string>
+    <string name="review_extract_question_header">Extract Question</string>
+    <string name="review_extract_generating_subtitle">Thinking through your review discussion and references to craft the question and answer…</string>
+    <string name="subject_duplicate_question_header">Question already exists</string>
+    <string name="subject_duplicate_question_message">The question already exists in your question list.</string>
+    <string name="subject_duplicate_matched_label">Existing question</string>
+    <string name="subject_copy_question_bank_button">Copy Question Bank</string>
+    <string name="subject_copy_question_bank_empty_subtitle">Empty · add questions</string>
+    <string name="subject_delete_question_bank_button">Delete Question Bank</string>
+    <string name="subject_delete_question_bank_empty_subtitle">Empty · nothing to delete</string>
+    <string name="subject_delete_question_bank_confirm_title">Delete entire question bank?</string>
+    <string name="subject_delete_question_bank_confirm_action">Delete all</string>
+    <string name="subject_delete_question_bank_cancel_action">Cancel</string>
+</resources>
