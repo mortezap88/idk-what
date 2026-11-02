@@ -16,6 +16,7 @@ import com.example.data.Flashcard
 import com.example.data.FlashcardStatus
 import com.example.data.FlashcardTypes
 import com.example.data.QuestionBankExporter
+import com.example.data.QuestionBankRefinementParser
 import com.example.data.SpacedRepetitionUtils
 import com.example.data.SrsStage
 import com.example.data.Subject
@@ -900,7 +901,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             dismissSubjectStatus(subjectId)
             _generatingQuestionsSubjectIds.value = _generatingQuestionsSubjectIds.value + subjectId
             _generatingQuestionProgress.value = _generatingQuestionProgress.value + (
-                subjectId to SubjectGenerationProgress(isThinking = true, reasoningChars = 0, addedCount = 0)
+                subjectId to SubjectGenerationProgress(
+                    step = 1,
+                    totalSteps = 2,
+                    isThinking = true,
+                    reasoningChars = 0,
+                    addedCount = 0
+                )
             )
 
             val existingQuestions = flashcardDao.getCardsBySubjectSnapshot(subjectId)
@@ -912,25 +919,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
             val baseTimestamp = System.currentTimeMillis()
-            val streamedChannel = Channel<ExamQuestionParser.ParsedQuestion>(Channel.UNLIMITED)
-            var insertedCount = 0
+            val step1Channel = Channel<ExamQuestionParser.ParsedQuestion>(Channel.UNLIMITED)
+            val step2Channel = Channel<QuestionBankRefinementParser.RefinementOperation>(Channel.UNLIMITED)
+            var step1InsertedCount = 0
             val insertedQuestions = HashSet<String>()
 
-            val writerJob = launch {
-                for (q in streamedChannel) {
+            val step1WriterJob = launch {
+                for (q in step1Channel) {
                     if (insertedQuestions.add(q.question)) {
                         flashcardDao.insertCard(
                             q.toExamCard(
                                 subjectId = subjectId,
-                                createdAtMillis = baseTimestamp + insertedCount
+                                createdAtMillis = baseTimestamp + step1InsertedCount
                             )
                         )
-                        insertedCount++
+                        step1InsertedCount++
                         _generatingQuestionProgress.value = _generatingQuestionProgress.value + (
                             subjectId to SubjectGenerationProgress(
+                                step = 1,
+                                totalSteps = 2,
                                 isThinking = false,
                                 reasoningChars = _generatingQuestionProgress.value[subjectId]?.reasoningChars ?: 0,
-                                addedCount = insertedCount
+                                addedCount = step1InsertedCount
                             )
                         )
                     }
@@ -944,8 +954,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val effectiveExtraKnowledge = subject.effectiveExtraKnowledge()
 
                 if (effectiveTextbook.isBlank()) {
-                    streamedChannel.close()
-                    writerJob.join()
+                    step1Channel.close()
+                    step1WriterJob.join()
                     postSubjectStatus(
                         subjectId = subjectId,
                         text = "Could not extract readable text from the Textbook image(s). Check your API key or tap an image in Textbook to retry OCR.",
@@ -954,7 +964,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                val result = geminiRepo.generateSubjectQuestions(
+                // --- STEP 1: Exhaustive initial question & answer generation ---
+                val step1Result = geminiRepo.generateSubjectQuestions(
                     subjectName = subject.name,
                     textbook = effectiveTextbook,
                     extraKnowledge = effectiveExtraKnowledge,
@@ -964,6 +975,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         if (current == null || current.addedCount == 0) {
                             _generatingQuestionProgress.value = _generatingQuestionProgress.value + (
                                 subjectId to SubjectGenerationProgress(
+                                    step = 1,
+                                    totalSteps = 2,
                                     isThinking = true,
                                     reasoningChars = chars,
                                     addedCount = current?.addedCount ?: 0
@@ -972,57 +985,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     },
                     onQuestionStreamed = { parsedQuestion ->
-                        streamedChannel.trySend(parsedQuestion)
+                        step1Channel.trySend(parsedQuestion)
                     }
                 )
 
-                streamedChannel.close()
-                writerJob.join()
+                step1Channel.close()
+                step1WriterJob.join()
 
-                result.onSuccess { outcome ->
-                    for (q in outcome.questions) {
-                        if (insertedQuestions.add(q.question)) {
-                            flashcardDao.insertCard(
-                                q.toExamCard(
-                                    subjectId = subjectId,
-                                    createdAtMillis = baseTimestamp + insertedCount
-                                )
-                            )
-                            insertedCount++
-                        }
-                    }
-
-                    when {
-                        outcome.wasInterruptedMidStream && insertedCount > 0 -> {
-                            postSubjectStatus(
-                                subjectId = subjectId,
-                                text = "Saved $insertedCount new question${if (insertedCount == 1) "" else "s"} before the stream paused — tap Generating questions again to continue from where it left off.",
-                                isError = false,
-                                isWarning = true
-                            )
-                        }
-
-                        insertedCount == 0 -> {
-                            postSubjectStatus(
-                                subjectId = subjectId,
-                                text = "Nothing new to generate — all Textbook concepts are already covered by your active, learned, and dumb questions.",
-                                isError = false
-                            )
-                        }
-
-                        else -> {
-                            postSubjectStatus(
-                                subjectId = subjectId,
-                                text = "Generated $insertedCount new question${if (insertedCount == 1) "" else "s"} from Textbook.",
-                                isError = false
-                            )
-                        }
-                    }
-                }.onFailure { error ->
-                    if (insertedCount > 0) {
+                val step1Outcome = step1Result.getOrElse { error ->
+                    if (error is CancellationException) throw error
+                    if (step1InsertedCount > 0) {
                         postSubjectStatus(
                             subjectId = subjectId,
-                            text = "Saved $insertedCount new question${if (insertedCount == 1) "" else "s"} before the stream paused — tap Generating questions again to continue from where it left off.",
+                            text = "Step 1 paused after saving $step1InsertedCount new question${if (step1InsertedCount == 1) "" else "s"} — tap Generating questions again to continue and run Step 2 refinement.",
                             isError = false,
                             isWarning = true
                         )
@@ -1033,12 +1008,235 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             isError = true
                         )
                     }
+                    return@launch
+                }
+
+                for (q in step1Outcome.questions) {
+                    if (insertedQuestions.add(q.question)) {
+                        flashcardDao.insertCard(
+                            q.toExamCard(
+                                subjectId = subjectId,
+                                createdAtMillis = baseTimestamp + step1InsertedCount
+                            )
+                        )
+                        step1InsertedCount++
+                    }
+                }
+
+                if (step1Outcome.wasInterruptedMidStream) {
+                    postSubjectStatus(
+                        subjectId = subjectId,
+                        text = "Step 1 paused after saving $step1InsertedCount new question${if (step1InsertedCount == 1) "" else "s"} — tap Generating questions again to finish and run Step 2 refinement.",
+                        isError = false,
+                        isWarning = true
+                    )
+                    return@launch
+                }
+
+                // --- STEP 2: Second API request — Complement, Fix/Edit & Combine ---
+                val snapshotForStep2 = flashcardDao.getCardsBySubjectSnapshot(subjectId)
+                var step2AddedCount = 0
+                var step2EditedCount = 0
+                var step2CombinedCount = 0
+                val appliedStep2Ops = ArrayList<QuestionBankRefinementParser.RefinementOperation>()
+                val step2BaseTimestamp = System.currentTimeMillis()
+
+                _generatingQuestionProgress.value = _generatingQuestionProgress.value + (
+                    subjectId to SubjectGenerationProgress(
+                        step = 2,
+                        totalSteps = 2,
+                        isThinking = true,
+                        reasoningChars = 0,
+                        addedCount = step1InsertedCount,
+                        step2AddedCount = 0,
+                        editedCount = 0,
+                        combinedCount = 0
+                    )
+                )
+
+                suspend fun executeStep2Op(op: QuestionBankRefinementParser.RefinementOperation) {
+                    val summary = QuestionBankRefinementParser.applyOperationToDatabase(
+                        subjectId = subjectId,
+                        operation = op,
+                        flashcardDao = flashcardDao,
+                        createdAtMillis = step2BaseTimestamp + step2AddedCount
+                    )
+                    if (!summary.hasAnyChange) return
+                    appliedStep2Ops.add(op)
+                    step2AddedCount += summary.addedCount
+                    step2EditedCount += summary.editedCount
+                    step2CombinedCount += summary.combinedCount
+                    syncActiveReviewListAfterRefinement(
+                        mergedAwayIds = summary.mergedAwayCardIds,
+                        updatedCardsById = summary.updatedCardsById
+                    )
+                    _generatingQuestionProgress.value = _generatingQuestionProgress.value + (
+                        subjectId to SubjectGenerationProgress(
+                            step = 2,
+                            totalSteps = 2,
+                            isThinking = false,
+                            reasoningChars = _generatingQuestionProgress.value[subjectId]?.reasoningChars ?: 0,
+                            addedCount = step1InsertedCount + step2AddedCount,
+                            step2AddedCount = step2AddedCount,
+                            editedCount = step2EditedCount,
+                            combinedCount = step2CombinedCount
+                        )
+                    )
+                }
+
+                val step2WriterJob = launch {
+                    for (op in step2Channel) {
+                        executeStep2Op(op)
+                    }
+                }
+
+                val step2Result = geminiRepo.complementAndRefineSubjectQuestions(
+                    subjectName = subject.name,
+                    textbook = effectiveTextbook,
+                    extraKnowledge = effectiveExtraKnowledge,
+                    currentCards = snapshotForStep2,
+                    onReasoningProgress = { chars ->
+                        val current = _generatingQuestionProgress.value[subjectId]
+                        if (current == null || current.isThinking) {
+                            _generatingQuestionProgress.value = _generatingQuestionProgress.value + (
+                                subjectId to SubjectGenerationProgress(
+                                    step = 2,
+                                    totalSteps = 2,
+                                    isThinking = true,
+                                    reasoningChars = chars,
+                                    addedCount = step1InsertedCount + step2AddedCount,
+                                    step2AddedCount = step2AddedCount,
+                                    editedCount = step2EditedCount,
+                                    combinedCount = step2CombinedCount
+                                )
+                            )
+                        }
+                    },
+                    onOperationStreamed = { op ->
+                        step2Channel.trySend(op)
+                    }
+                )
+
+                step2Channel.close()
+                step2WriterJob.join()
+
+                step2Result.onSuccess { step2Outcome ->
+                    // Ensure any end-of-stream salvaged operations not yet processed are applied.
+                    if (step2Outcome.operations.size > appliedStep2Ops.size) {
+                        for (op in step2Outcome.operations.drop(appliedStep2Ops.size)) {
+                            executeStep2Op(op)
+                        }
+                    }
+
+                    val totalAdded = step1InsertedCount + step2AddedCount
+                    val statusMessage = formatTwoStepCompletionStatus(
+                        step1Added = step1InsertedCount,
+                        step2Added = step2AddedCount,
+                        editedCount = step2EditedCount,
+                        combinedCount = step2CombinedCount,
+                        wasStep2Interrupted = step2Outcome.wasInterruptedMidStream
+                    )
+
+                    postSubjectStatus(
+                        subjectId = subjectId,
+                        text = statusMessage,
+                        isError = false,
+                        isWarning = step2Outcome.wasInterruptedMidStream &&
+                            (totalAdded > 0 || step2EditedCount > 0 || step2CombinedCount > 0)
+                    )
+                }.onFailure { step2Error ->
+                    if (step2Error is CancellationException) throw step2Error
+                    val totalAdded = step1InsertedCount + step2AddedCount
+                    if (totalAdded > 0 || step2EditedCount > 0 || step2CombinedCount > 0) {
+                        postSubjectStatus(
+                            subjectId = subjectId,
+                            text = buildString {
+                                append("Saved $totalAdded new question${if (totalAdded == 1) "" else "s"}")
+                                if (step2EditedCount > 0) append(", fixed $step2EditedCount")
+                                if (step2CombinedCount > 0) append(", combined $step2CombinedCount")
+                                append(" — Step 2 refinement paused (${step2Error.localizedMessage ?: "connection interrupted"}). Tap Generating questions again to re-audit.")
+                            },
+                            isError = false,
+                            isWarning = true
+                        )
+                    } else {
+                        postSubjectStatus(
+                            subjectId = subjectId,
+                            text = step2Error.localizedMessage ?: "Step 2 question bank refinement failed.",
+                            isError = true
+                        )
+                    }
                 }
             } finally {
-                streamedChannel.close()
+                step1Channel.close()
+                step2Channel.close()
                 _generatingQuestionsSubjectIds.value = _generatingQuestionsSubjectIds.value - subjectId
                 _generatingQuestionProgress.value = _generatingQuestionProgress.value - subjectId
             }
+        }
+    }
+
+    private fun syncActiveReviewListAfterRefinement(
+        mergedAwayIds: Set<Long>,
+        updatedCardsById: Map<Long, Flashcard>
+    ) {
+        if (mergedAwayIds.isEmpty() && updatedCardsById.isEmpty()) return
+        val currentList = _activeReviewList.value
+        if (currentList.isEmpty()) return
+        val activeCardIdBefore = currentList.getOrNull(_currentReviewIndex.value)?.id
+
+        val nextList = currentList
+            .filterNot { it.id in mergedAwayIds }
+            .map { updatedCardsById[it.id] ?: it }
+
+        if (nextList == currentList) return
+        _activeReviewList.value = nextList
+        if (_currentReviewIndex.value >= nextList.size) {
+            _currentReviewIndex.value = (nextList.size - 1).coerceAtLeast(0)
+        }
+        val activeCardIdAfter = nextList.getOrNull(_currentReviewIndex.value)?.id
+        if (activeCardIdBefore != activeCardIdAfter ||
+            (activeCardIdAfter != null && activeCardIdAfter in updatedCardsById && _reviewChatHistory.value.size <= 1)
+        ) {
+            loadActiveCardDetails()
+        }
+    }
+
+    private fun formatTwoStepCompletionStatus(
+        step1Added: Int,
+        step2Added: Int,
+        editedCount: Int,
+        combinedCount: Int,
+        wasStep2Interrupted: Boolean
+    ): String {
+        val totalAdded = step1Added + step2Added
+        if (totalAdded == 0 && editedCount == 0 && combinedCount == 0) {
+            return "2-step audit complete — your Question Bank is already logical, complete, and covers all Textbook angles."
+        }
+
+        val parts = mutableListOf<String>()
+        if (totalAdded > 0) {
+            val breakdown = if (step1Added > 0 && step2Added > 0) {
+                " ($step1Added initial + $step2Added complementary)"
+            } else if (step2Added > 0) {
+                " complementary"
+            } else {
+                ""
+            }
+            parts.add("added $totalAdded$breakdown question${if (totalAdded == 1) "" else "s"}")
+        }
+        if (editedCount > 0) {
+            parts.add("fixed & refined $editedCount")
+        }
+        if (combinedCount > 0) {
+            parts.add("combined $combinedCount")
+        }
+
+        val joined = parts.joinToString(", ").replaceFirstChar { it.uppercase() }
+        return if (wasStep2Interrupted) {
+            "2-step pass paused early: $joined — tap Generating questions again to finish auditing."
+        } else {
+            "2-step generation complete: $joined."
         }
     }
 
@@ -2036,9 +2234,14 @@ data class SubjectStatusNotice(
 )
 
 data class SubjectGenerationProgress(
+    val step: Int = 1,
+    val totalSteps: Int = 2,
     val isThinking: Boolean = true,
     val reasoningChars: Int = 0,
-    val addedCount: Int = 0
+    val addedCount: Int = 0,
+    val step2AddedCount: Int = 0,
+    val editedCount: Int = 0,
+    val combinedCount: Int = 0
 )
 
 sealed interface SubjectQuestionDraftState {

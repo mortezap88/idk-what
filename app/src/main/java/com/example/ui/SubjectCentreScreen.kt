@@ -685,16 +685,33 @@ private fun SubjectDetailContent(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     SubjectTopActionTile(
-                        title = "Generating questions",
+                        title = stringResource(R.string.subject_generate_questions_button),
                         subtitle = when {
+                            isGeneratingQuestions && generationProgress?.step == 2 -> {
+                                val s2Added = generationProgress.step2AddedCount
+                                val s2Edited = generationProgress.editedCount
+                                val s2Combined = generationProgress.combinedCount
+                                if (s2Added > 0 || s2Edited > 0 || s2Combined > 0) {
+                                    buildString {
+                                        append("Step 2/2 ·")
+                                        if (s2Added > 0) append(" +$s2Added")
+                                        if (s2Edited > 0) append(" · ${s2Edited}fx")
+                                        if (s2Combined > 0) append(" · ${s2Combined}mg")
+                                    }
+                                } else {
+                                    "Step 2/2 · auditing…"
+                                }
+                            }
                             isGeneratingQuestions && (generationProgress?.addedCount ?: 0) > 0 ->
-                                "Added ${generationProgress?.addedCount} · streaming…"
+                                "Step 1/2 · +${generationProgress?.addedCount} streaming…"
                             isGeneratingQuestions && (generationProgress?.reasoningChars ?: 0) > 0 ->
-                                "Deep thinking…"
-                            isGeneratingQuestions -> "High thinking…"
-                            hasTextbook && cards.isEmpty() -> "High thinking · all"
-                            hasTextbook -> "High thinking · new only"
-                            else -> "Add textbook first"
+                                "Step 1/2 · thinking…"
+                            isGeneratingQuestions -> "Step 1/2 · starting…"
+                            hasTextbook && cards.isEmpty() ->
+                                stringResource(R.string.subject_generate_questions_idle_empty)
+                            hasTextbook ->
+                                stringResource(R.string.subject_generate_questions_idle_existing)
+                            else -> stringResource(R.string.subject_generate_questions_no_textbook)
                         },
                         icon = Icons.Default.AutoAwesome,
                         isLoading = isGeneratingQuestions,
@@ -826,11 +843,46 @@ private fun SubjectDetailContent(
 
             if (isGeneratingQuestions) {
                 item {
+                    val currentStep = generationProgress?.step ?: 1
                     val addedSoFar = generationProgress?.addedCount ?: 0
-                    val liveBannerText = if (addedSoFar > 0) {
-                        "Streaming live — $addedSoFar question${if (addedSoFar == 1) "" else "s"} appended to your list so far (saved automatically even if interrupted)…"
-                    } else {
-                        "Examining Textbook with high thinking — each question will append below live as soon as streaming starts…"
+                    val step2Added = generationProgress?.step2AddedCount ?: 0
+                    val editedSoFar = generationProgress?.editedCount ?: 0
+                    val combinedSoFar = generationProgress?.combinedCount ?: 0
+
+                    val liveBannerText = when {
+                        currentStep == 2 && (step2Added > 0 || editedSoFar > 0 || combinedSoFar > 0) -> {
+                            buildString {
+                                append("Step 2/2 refining bank live — ")
+                                val actions = mutableListOf<String>()
+                                if (step2Added > 0) {
+                                    actions.add("+$step2Added complementary added")
+                                }
+                                if (editedSoFar > 0) {
+                                    actions.add("$editedSoFar fixed")
+                                }
+                                if (combinedSoFar > 0) {
+                                    actions.add("$combinedSoFar combined")
+                                }
+                                append(actions.joinToString(", "))
+                                if (addedSoFar > step2Added) {
+                                    append(" (${addedSoFar - step2Added} added in Step 1)")
+                                }
+                                append("…")
+                            }
+                        }
+                        currentStep == 2 -> {
+                            if (addedSoFar > 0) {
+                                "Step 2/2 — Step 1 added $addedSoFar question${if (addedSoFar == 1) "" else "s"}; now auditing to add missing angles, fix unclear questions, and combine fragments…"
+                            } else {
+                                stringResource(R.string.subject_generate_step2_thinking_banner)
+                            }
+                        }
+                        addedSoFar > 0 -> {
+                            "Step 1/2 streaming live — $addedSoFar question${if (addedSoFar == 1) "" else "s"} appended so far (Step 2 audit & complement runs next)…"
+                        }
+                        else -> {
+                            stringResource(R.string.subject_generate_step1_thinking_banner)
+                        }
                     }
                     Row(
                         modifier = Modifier

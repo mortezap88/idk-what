@@ -31,4 +31,11 @@
     <string name="subject_delete_question_bank_confirm_title">Delete entire question bank?</string>
     <string name="subject_delete_question_bank_confirm_action">Delete all</string>
     <string name="subject_delete_question_bank_cancel_action">Cancel</string>
+    <string name="subject_generate_questions_button">Generating questions</string>
+    <string name="subject_generate_questions_idle_empty">2-step · build &amp; refine</string>
+    <string name="subject_generate_questions_idle_existing">2-step · expand &amp; fix</string>
+    <string name="subject_generate_questions_no_textbook">Add textbook first</string>
+    <string name="subject_generate_step1_thinking_banner">Step 1/2 — Examining Textbook with high thinking to generate questions &amp; answers…</string>
+    <string name="subject_generate_step2_thinking_banner">Step 2/2 — Auditing your question bank to add missing angles, fix unclear items, and combine fragments…</string>
 </resources>
+

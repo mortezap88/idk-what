@@ -6,6 +6,7 @@ import android.util.Base64
 import com.example.data.ExamQuestionParser
 import com.example.data.Flashcard
 import com.example.data.FlashcardStatus
+import com.example.data.QuestionBankRefinementParser
 import com.example.data.Subject
 import com.example.settings.AppSettingsRepository
 import com.squareup.moshi.Moshi
@@ -657,6 +658,116 @@ class GeminiRepository(private val settingsRepository: AppSettingsRepository) {
         )
     }
 
+    data class SubjectQuestionRefinementOutcome(
+        val operations: List<QuestionBankRefinementParser.RefinementOperation>,
+        val wasInterruptedMidStream: Boolean = false,
+        val interruptionMessage: String? = null
+    )
+
+    /**
+     * Step 2 of the two-step question bank pipeline: sends a separate second API request that
+     * audits the entire current question bank against the Textbook to:
+     *  1. Add missing / complementary questions (supporting diverse ways of thinking AND granular
+     *     or seemingly "silly"/literal exam-testable details).
+     *  2. Fix and edit any active questions that don't make sense, are ambiguous, illogical, or
+     *     have incomplete/inaccurate answers.
+     *  3. Combine active questions ONLY when merging genuinely makes them clearer and more logical
+     *     (preserving high overall question volume).
+     */
+    suspend fun complementAndRefineSubjectQuestions(
+        subjectName: String,
+        textbook: String,
+        extraKnowledge: String,
+        currentCards: List<Flashcard>,
+        onReasoningProgress: (Int) -> Unit = {},
+        onOperationStreamed: (QuestionBankRefinementParser.RefinementOperation) -> Unit = {}
+    ): Result<SubjectQuestionRefinementOutcome> = withContext(Dispatchers.IO) {
+        val cleanTextbook = textbook.trim()
+        if (cleanTextbook.isEmpty()) {
+            return@withContext Result.failure(
+                IllegalArgumentException("Textbook is empty. Add answer reference material to Textbook first.")
+            )
+        }
+
+        val prompt = buildSubjectQuestionRefinementPrompt(
+            subjectName = subjectName,
+            textbook = cleanTextbook,
+            extraKnowledge = extraKnowledge,
+            currentCards = currentCards
+        )
+
+        val system = buildString {
+            append("You are a master exam strategist, logician, and second-pass question bank auditor. ")
+            append("You audit an existing question bank against the authoritative TEXTBOOK to make the bank rock-solid, logical, practical, and exam-complete. ")
+            append("You strongly favor MORE questions in general, support diverse ways of thinking (conceptual, practical/applied, cause-effect, reverse-lookup, comparisons, edge cases, AND granular/literal or seemingly 'silly' textbook facts that exams still test), ")
+            append("fix any active question that doesn't make sense or has a weak answer, and combine active questions ONLY when merging genuinely creates a clearer, stronger question. ")
+            append("Stream every action cleanly inside `[op_item]` blocks (or output `[no_refinements_needed]` if already 100% solid and complete) with zero outside commentary.")
+        }
+
+        val messages = listOf(
+            AvalAiClient.Message(role = "system", content = system),
+            AvalAiClient.Message(role = "user", content = prompt)
+        )
+
+        val activeIds = currentCards.filter { it.isActive }.map { it.id }.toSet()
+        val collector = QuestionBankRefinementParser.IncrementalRefinementCollector(
+            activeCardIds = activeIds,
+            existingQuestions = currentCards.map { it.word },
+            onOperation = onOperationStreamed
+        )
+
+        val streamResult = avalAiClient.completeWithSettings(
+            messages = messages,
+            settingsRepository = settingsRepository,
+            temperature = null,
+            reasoningEffort = AvalAiClient.HIGH_REASONING_EFFORT,
+            maxTokens = null,
+            streamResponses = true,
+            onReasoningProgress = onReasoningProgress,
+            onPartialText = { partialText ->
+                collector.onPartialStream(partialText)
+            }
+        )
+
+        streamResult.fold(
+            onSuccess = { finalRaw ->
+                collector.finish(finalRaw)
+                Result.success(
+                    SubjectQuestionRefinementOutcome(
+                        operations = collector.emittedOperations,
+                        wasInterruptedMidStream = false
+                    )
+                )
+            },
+            onFailure = { error ->
+                val partialErr = error as? AvalAiClient.PartialStreamInterruptedException
+                if (partialErr != null) {
+                    collector.finish(partialErr.partialContent)
+                    if (collector.emittedOperations.isNotEmpty()) {
+                        return@fold Result.success(
+                            SubjectQuestionRefinementOutcome(
+                                operations = collector.emittedOperations,
+                                wasInterruptedMidStream = true,
+                                interruptionMessage = partialErr.localizedMessage
+                            )
+                        )
+                    }
+                }
+                if (collector.emittedOperations.isNotEmpty()) {
+                    Result.success(
+                        SubjectQuestionRefinementOutcome(
+                            operations = collector.emittedOperations,
+                            wasInterruptedMidStream = true,
+                            interruptionMessage = error.localizedMessage
+                        )
+                    )
+                } else {
+                    Result.failure(error)
+                }
+            }
+        )
+    }
+
     private suspend fun generatePromptAnswer(
         prompt: String,
         system: String,
@@ -844,10 +955,11 @@ class GeminiRepository(private val settingsRepository: AppSettingsRepository) {
                     (Empty — this is the first pass over the Textbook.)
 
                     EXHAUSTIVE GENERATION TASK (FIRST PASS):
-                    Examine EVERY paragraph, section, definition, mechanism, cause-and-effect chain, comparison, condition, exception, and principle in the TEXTBOOK above in order from start to finish.
-                    - Generate LITERALLY EVERY worthwhile, self-contained, non-overlapping question that can be asked to master 100% of this Textbook (there is NO small cap — if the Textbook contains 30, 60, or 100+ distinct testable ideas, generate ALL of them).
-                    - Every question must test a genuine concept, mechanism, distinction, or fact from the Textbook — never create meaningless, circular, or pedantic filler questions.
-                    - Ensure no two generated questions ask the same thing in slightly different words.
+                    Examine EVERY paragraph, section, definition, mechanism, cause-and-effect chain, comparison, condition, exception, formula, classification, and granular detail in the TEXTBOOK above in order from start to finish.
+                    - Prefer MORE questions in general: generate LITERALLY EVERY worthwhile, self-contained, non-overlapping question that can be asked to master 100% of this Textbook (there is NO small cap — if the Textbook contains 30, 60, or 100+ distinct testable points, generate ALL of them).
+                    - Support different ways of thinking: include conceptual ("why/how"), practical/scenario-based, comparison/distinction, reverse-lookup, AND specific literal/granular facts, numbers, lists, or seemingly simple/small details from the Textbook that could show up on an exam and must be remembered.
+                    - Keep every question logical, practical, and clear — never create broken, vague, or circular questions.
+                    - Ensure no two generated questions ask the exact same thing in slightly different words.
                     - In your thinking phase, keep your outline compact (do not write out every full question and answer twice inside thoughts) so you can stream all `[q_item]` blocks smoothly from beginning to end.
                     """.trimIndent()
                 )
@@ -871,7 +983,7 @@ class GeminiRepository(private val settingsRepository: AppSettingsRepository) {
                     }
                 }
                 if (dumbList.isNotEmpty()) {
-                    append("\n3) DUMB / REJECTED QUESTIONS (explicitly flagged by the learner as meaningless, too trivial, poorly framed, or useless — NEVER recreate these AND avoid generating similar low-value/nonsensical questions):\n")
+                    append("\n3) DUMB / REJECTED QUESTIONS (explicitly flagged by the learner as meaningless, poorly framed, or rejected — NEVER recreate these exact rejected questions):\n")
                     dumbList.forEachIndexed { idx, item ->
                         append("   [D${idx + 1}] ${item.question}\n")
                     }
@@ -882,10 +994,10 @@ class GeminiRepository(private val settingsRepository: AppSettingsRepository) {
                     """
                     EXHAUSTIVE GAP-ANALYSIS & GENERATION TASK (CONNECTED PASS):
                     1. Compare the entire TEXTBOOK section-by-section against ALL existing questions above (Active + Learned + Dumb).
-                    2. Treat any question that tests the same underlying fact, mechanism, or answer as an existing question as ALREADY COVERED — even if phrased differently.
-                    3. Respect the DUMB / REJECTED list: never regenerate those questions or invent similarly trivial, pedantic, or nonsensical questions.
-                    4. Find EVERY remaining concept, mechanism, relationship, distinction, or important detail in the TEXTBOOK that has NOT been asked yet, and generate all genuinely new, high-value questions for those uncovered parts (continuing naturally from wherever the existing list left off).
-                    5. IF NOTHING GENUINELY NEW REMAINS: If the Textbook is already thoroughly covered by the existing questions above, DO NOT force or invent random useless questions — output ONLY the exact tag: [no_more_questions]
+                    2. Treat any question that tests the exact same underlying fact, mechanism, or answer as an existing question as ALREADY COVERED — even if phrased differently.
+                    3. Respect the DUMB / REJECTED list: never regenerate those rejected questions.
+                    4. Prefer MORE questions in general: find EVERY remaining concept, mechanism, practical application, comparison, inverse angle, exception, or specific exam-testable detail in the TEXTBOOK that has NOT been asked yet, and generate logical, practical questions for all uncovered parts.
+                    5. IF NOTHING GENUINELY NEW REMAINS: If the Textbook is already covered by the existing questions above, output ONLY the exact tag: [no_more_questions]
                     """.trimIndent()
                 )
                 append("\n\n")
@@ -902,6 +1014,121 @@ class GeminiRepository(private val settingsRepository: AppSettingsRepository) {
                 [a] ...authoritative textbook answer... [/a]
                 [/q_item]
                 - Output ONLY `[q_item] ... [/q_item]` blocks back-to-back (or `[no_more_questions]` if nothing new remains), with zero intro, numbering outside tags, or closing commentary.
+                """.trimIndent()
+            )
+        }
+
+        /**
+         * Builds the Step 2 (Complement, Audit & Refinement) prompt that examines the entire
+         * current question bank alongside the Textbook to add missing angles/exam details, fix
+         * flawed active questions, and selectively combine fragmented active questions.
+         */
+        fun buildSubjectQuestionRefinementPrompt(
+            subjectName: String,
+            textbook: String,
+            extraKnowledge: String,
+            currentCards: List<Flashcard>
+        ): String = buildString {
+            append("Subject: $subjectName\n\n")
+            append("TEXTBOOK (MAIN AUTHORITATIVE SOURCE — GROUND ALL QUESTIONS & ANSWERS STRICTLY IN THIS):\n\"\"\"\n")
+            append(textbook.trim())
+            append("\n\"\"\"\n\n")
+
+            if (extraKnowledge.isNotBlank()) {
+                append("EXTRA KNOWLEDGE (BACKING CONTEXT ONLY — DO NOT TEST OR REQUIRE IN ANSWERS):\n\"\"\"\n")
+                append(extraKnowledge.trim())
+                append("\n\"\"\"\n")
+                append("Rule: Extra Knowledge is background context only. Never require Extra Knowledge facts in `[a]`.\n\n")
+            }
+
+            val activeCards = currentCards.filter { it.isActive }
+            val learnedCards = currentCards.filter { it.isLearned }
+            val dumbCards = currentCards.filter { it.isDumb }
+
+            append("CURRENT QUESTION BANK IN THIS SUBJECT (TOTAL: ${currentCards.size}):\n")
+            if (activeCards.isEmpty()) {
+                append("\n1) ACTIVE QUESTIONS (EDITABLE / COMBINABLE): (None currently active)\n")
+            } else {
+                append("\n1) ACTIVE QUESTIONS (EDITABLE & COMBINABLE — reference by exact numeric ID):\n")
+                activeCards.forEach { card ->
+                    val compactAnswer = card.backText.orEmpty().replace(Regex("\\s+"), " ").trim()
+                    append("   [ID: ${card.id}]\n")
+                    append("   Q: ${card.word.trim()}\n")
+                    append("   A: $compactAnswer\n")
+                }
+            }
+
+            if (learnedCards.isNotEmpty()) {
+                append("\n2) LEARNED QUESTIONS (READ-ONLY — already mastered; DO NOT edit, combine, or duplicate):\n")
+                learnedCards.forEachIndexed { idx, card ->
+                    append("   [L${idx + 1}] ${card.word.trim()}\n")
+                }
+            }
+
+            if (dumbCards.isNotEmpty()) {
+                append("\n3) DUMB / REJECTED QUESTIONS (READ-ONLY — explicitly rejected by learner; NEVER recreate or edit):\n")
+                dumbCards.forEachIndexed { idx, card ->
+                    append("   [D${idx + 1}] ${card.word.trim()}\n")
+                }
+            }
+
+            append("\n")
+            append(
+                """
+                SECOND-PASS COMPLEMENT, AUDIT & REFINEMENT MISSION (STEP 2 OF 2):
+                You are performing a dedicated second pass to make this question bank rock-solid, logical, practical, and completely exam-ready. Carefully check the TEXTBOOK line-by-line against the CURRENT QUESTION BANK above and answer ALL THREE questions below:
+
+                1) FIX & EDIT (`[action] EDIT [/action]`): "What active questions should we fix and edit?"
+                   - Inspect every ACTIVE question (`[ID: ...]`) and its answer.
+                   - If any question doesn't make sense, is confusing, illogical, poorly worded, lacks necessary context to stand on its own, tests something outside the Textbook, or has an incomplete/inaccurate answer, rewrite and fix it using `EDIT` with its exact `[ids] <ID> [/ids]`.
+                   - Leave active questions untouched if they are already clear, logical, practical, and accurate.
+
+                2) SELECTIVE COMBINE (`[action] COMBINE [/action]`): "What active questions would genuinely be better if we combined them?"
+                   - Check if two or more ACTIVE questions (`[ID: ...]`) are near-duplicates or awkward, broken micro-fragments that make much more logical and practical sense merged into ONE cohesive question and answer (`[ids] <ID1>, <ID2> [/ids]`).
+                   - IMPORTANT — DO NOT OVER-MERGE: The learner explicitly prefers MORE questions in general! Do NOT merge distinct concepts, distinct angles, or independently testable exam facts just to shorten the list. Combine ONLY when keeping them separate is genuinely redundant, confusing, or fragmented.
+
+                3) COMPLEMENT & EXPAND (`[action] ADD [/action]`): "What other questions can we add to make the question bank even more complete?"
+                   - Strongly favor MORE questions in general so nothing from the Textbook can surprise the learner on an exam.
+                   - Support DIFFERENT WAYS OF THINKING:
+                     * Direct recall & crisp definitions
+                     * "Why / How" causal & mechanistic reasoning
+                     * Practical / applied / scenario-based ("What happens if...", "When should X be used over Y?")
+                     * Reverse-angle questions (given the effect, symptom, property, or example -> identify the concept/cause)
+                     * Comparisons, contrasts, boundary conditions, and exceptions
+                   - INCLUDE "SILLY" BUT EXAM-TESTABLE DETAILS: Sometimes a question feels simple, literal, granular, or even slightly "silly" (specific numbers, thresholds, names, order of steps, classifications, parenthetical notes, edge facts), YET professors and exams routinely test them! If it is in the Textbook and could appear on an exam, the learner wants to know, remember, and learn it — ADD it as a clear, logical, practical question (while still respecting any exact items the learner already put in DUMB).
+                   - Never duplicate a question that is already covered in ACTIVE, LEARNED, DUMB, or your own edits/combinations.
+
+                STRICT STREAMING OUTPUT FORMAT:
+                - Write all questions and answers in the primary language of the TEXTBOOK (e.g., Persian if Persian, English if English).
+                - Keep thinking concise so you can stream all `[op_item]` blocks smoothly.
+                - Emit operations in logical order (`EDIT` and `COMBINE` fixes first, then all complementary `ADD` questions), framing EVERY single operation in its own `[op_item]` block:
+
+                For fixing an existing ACTIVE question:
+                [op_item]
+                [action] EDIT [/action]
+                [ids] 42 [/ids]
+                [q] ...improved, logical, self-contained question... [/q]
+                [a] ...complete, accurate textbook answer... [/a]
+                [/op_item]
+
+                For combining 2+ existing ACTIVE questions when genuinely better together:
+                [op_item]
+                [action] COMBINE [/action]
+                [ids] 42, 47 [/ids]
+                [q] ...unified, clearer combined question... [/q]
+                [a] ...complete combined textbook answer... [/a]
+                [/op_item]
+
+                For adding a new complementary question:
+                [op_item]
+                [action] ADD [/action]
+                [q] ...new complementary question... [/q]
+                [a] ...authoritative textbook answer... [/a]
+                [/op_item]
+
+                - Do NOT reuse the same `<ID>` across multiple `EDIT` or `COMBINE` blocks, and ONLY reference IDs from section `1) ACTIVE QUESTIONS`.
+                - If after thorough audit every active question is already logical/accurate, none need combining, and every possible angle and exam detail in the Textbook is already covered, output ONLY: [no_refinements_needed]
+                - Output ONLY `[op_item] ... [/op_item]` blocks (or `[no_refinements_needed]`) with zero preamble or commentary outside tags.
                 """.trimIndent()
             )
         }
